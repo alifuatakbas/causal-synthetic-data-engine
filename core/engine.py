@@ -11,26 +11,39 @@ class CausalNode:
         self.params = params or {}
         self.data =None
 
-    def sample(self , n_samples):
-        ## Check parents
-        parent_values = [p.data for p in self.parents if p.data is not None]
+    def sample(self, n_samples):
+        if self.distribution == "categorical":
+            # Probability-based selection for strings
+            choices = self.params.get("choices", [])
+            probs = self.params.get("probs", None)
+            self.data = np.random.choice(choices, size=n_samples, p=probs)
 
-        if not parent_values:
-                if self.distribution == "normal":
-                    self.data = np.random.normal(
-                        self.params.get("mean",0),
-                        self.params.get("std",1),
-                        n_samples
-                  )
-        else:
-            base = self.params.get("intercept",0)
-            slope = self.params.get("slope",1)
-            noise_std = self.params.get("noise",0.1)
+        elif self.distribution == "normal":
+            if not self.parents:
+                # Root numeric node
+                self.data = np.random.normal(
+                    self.params.get("mean", 0),
+                    self.params.get("std", 1),
+                    n_samples
+                )
+            else:
+                # Dependent numeric node with Hybrid Parent support
+                intercept = self.params.get("intercept", 0)
+                total_effect = intercept
 
-            combined_parent_effect = np.mean(parent_values,axis=0)
+                for parent in self.parents:
+                    # Check if parent is numeric or categorical
+                    if isinstance(parent.data[0], (int, float, np.number)):
+                        slope = self.params.get(f"slope_{parent.name}", 1)
+                        total_effect += (slope * parent.data)
+                    else:
+                        # Discrete Mapping (The 'Categorical Slope')
+                        mapping = self.params.get(f"map_{parent.name}", {})
+                        effect_multiplier = np.array([mapping.get(val, 1.0) for val in parent.data])
+                        total_effect *= effect_multiplier
 
-            self.data = base + (slope * combined_parent_effect) + \
-                                    np.random.normal(0,noise_std,n_samples)
+                noise_std = self.params.get("noise", 0.1)
+                self.data = total_effect + np.random.normal(0, noise_std, n_samples)
 
         return self.data
 
@@ -44,12 +57,25 @@ class CausalGraph:
     def _get_execution_order(self):
         ordered_nodes = []
         visited = set()
+        visiting = set()
 
         def visit(node):
+            # 1. Eğer düğüm zaten 'visiting' içindeyse, bir döngü bulduk demektir!
+            if node.name in visiting:
+                raise ValueError(
+                    f"Causal Cycle Detected! Node '{node.name}' depends on itself "
+                    f"through its ancestry. Graphs must be Directed Acyclic (DAG)."
+                )
+
             if node.name not in visited:
-                # Recursively visit all parents first (Depth First Search)
+                # Düğümü işlem yoluna ekle
+                visiting.add(node.name)
+
                 for parent in node.parents:
                     visit(parent)
+
+                # İşlem bittiğinde işlem yolundan çıkar ve 'tamamlandı'ya ekle
+                visiting.remove(node.name)
                 visited.add(node.name)
                 ordered_nodes.append(node)
 
@@ -59,14 +85,11 @@ class CausalGraph:
         return ordered_nodes
 
     def generate(self, n_samples):
-        print(f"--- Starting data generation for {n_samples} samples ---")
-
-        # Determine the correct order to avoid dependency errors
+        # Önce topolojik sırayı alıyoruz, eğer döngü varsa burada ValueError fırlayacak
         execution_order = self._get_execution_order()
         results = {}
 
         for node in execution_order:
-            print(f"Generating node: {node.name}...")
             results[node.name] = node.sample(n_samples)
 
         return pd.DataFrame(results)
@@ -75,19 +98,18 @@ class CausalGraph:
 if __name__ == "__main__":
     factory = CausalGraph()
 
-    # Define nodes
-    age_node = CausalNode("age", params={"mean": 40, "std": 12})
+    # Kısır Döngü Senaryosu: A -> B -> A
+    node_a = CausalNode("node_a")
+    node_b = CausalNode("node_b", parents=[node_a])
 
-    # income depends on age
-    income_node = CausalNode("income", parents=[age_node],
-                             params={"intercept": 2000, "slope": 150, "noise": 300})
+    # Hata burada: A'yı B'nin ebeveyni yaptık, şimdi B'yi de A'nın ebeveyni yapıyoruz
+    node_a.parents = [node_b]
 
-    # Even if we add income first, CausalGraph should handle it
-    factory.add_node(income_node)
-    factory.add_node(age_node)
+    factory.add_node(node_a)
+    factory.add_node(node_b)
 
-    # Generate the data
-    df = factory.generate(n_samples=1000)
-
-    print("\nData Preview:")
-    print(df.head())
+    try:
+        # Bu satır ValueError fırlatmalı!
+        df = factory.generate(100)
+    except ValueError as e:
+        print(f"Success! Caught expected error: {e}")
